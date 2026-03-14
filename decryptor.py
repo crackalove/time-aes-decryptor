@@ -2,6 +2,7 @@ import os
 import platform
 import time
 import sys
+import argparse
 from ctypes import c_int, cdll, CDLL
 from Crypto.Cipher import AES
 
@@ -17,23 +18,29 @@ def get_c_runtime():
     else:
         raise OSError("Неподдерживаемая операционная система")
 
-def generate_key_for_seed(seed, key_length=32):
-    c_runtime = get_c_runtime()
-    
-    c_runtime.srand.argtypes = [c_int]
-    c_runtime.srand.restype = None
-    c_runtime.rand.argtypes = []
-    c_runtime.rand.restype = c_int
+C_RUNTIME = get_c_runtime()
+C_RUNTIME.srand.argtypes = [c_int]
+C_RUNTIME.srand.restype = None
+C_RUNTIME.rand.argtypes = []
+C_RUNTIME.rand.restype = c_int
 
-    c_runtime.srand(seed)
-    
+def generate_key_for_seed(seed, key_length=32):
+    C_RUNTIME.srand(seed)
     key = bytearray(key_length)
     for i in range(key_length):
-        key[i] = c_runtime.rand() % 256
-        
+        key[i] = C_RUNTIME.rand() % 256
     return bytes(key)
 
-def brute_force_decrypt(file_path, search_window_seconds=120):
+def unpad_pkcs7(data):
+    if len(data) == 0:
+        return data
+    padding_len = data[-1]
+    if 1 <= padding_len <= 16:
+        if data[-padding_len:] == bytes([padding_len]) * padding_len:
+            return data[:-padding_len]
+    return data
+
+def brute_force_decrypt(file_path, search_window_seconds=120, custom_timestamp=None):
     signatures = {
         b'MZ': "Windows Executable (EXE/DLL)",
         b'%PDF': "PDF Document",
@@ -45,13 +52,17 @@ def brute_force_decrypt(file_path, search_window_seconds=120):
     }
 
     try:
-        file_mod_time = int(os.path.getmtime(file_path))
+        if custom_timestamp:
+            file_mod_time = custom_timestamp
+        else:
+            file_mod_time = int(os.path.getmtime(file_path))
+            
         print(f"Время модификации файла: {time.ctime(file_mod_time)} (Timestamp: {file_mod_time})")
 
         with open(file_path, 'rb') as f:
-            encrypted_header = f.read(16)
+            file_data = f.read()
         
-        if not encrypted_header or len(encrypted_header) < 16:
+        if len(file_data) < 32:
             print("Файл слишком мал или пуст.")
             return None
 
@@ -65,41 +76,48 @@ def brute_force_decrypt(file_path, search_window_seconds=120):
                 print(f"\rПроверяю сид: {seed}   ", end="", flush=True)
 
             key = generate_key_for_seed(seed)
-            cipher = AES.new(key, AES.MODE_ECB)
             
-            try:
-                decrypted_header = cipher.decrypt(encrypted_header)
+            for aes_mode in [AES.MODE_ECB, AES.MODE_CBC]:
+                if aes_mode == AES.MODE_CBC:
+                    iv = file_data[:16]
+                    encrypted_part = file_data[16:32]
+                    cipher = AES.new(key, aes_mode, iv)
+                else:
+                    encrypted_part = file_data[:16]
+                    cipher = AES.new(key, aes_mode)
                 
-                format_found = False
-                for sig, file_type in signatures.items():
-                    if decrypted_header.startswith(sig):
-                        print(f"\n\nНайден сид (timestamp): {seed}")
-                        print(f"Определен формат: {file_type}")
-                        print(f"AES Ключ (hex): {key.hex()}")
-                        format_found = True
-                        break
-                
-                if format_found:
-                    print("Расшифровываю весь файл...")
-                    with open(file_path, 'rb') as f_enc:
-                        encrypted_data = f_enc.read()
+                try:
+                    decrypted_part = cipher.decrypt(encrypted_part)
                     
-                    full_cipher = AES.new(key, AES.MODE_ECB)
-                    decrypted_data = full_cipher.decrypt(encrypted_data)
+                    format_found = False
+                    for sig, file_type in signatures.items():
+                        if decrypted_part.startswith(sig):
+                            print(f"\n\nНайден сид (timestamp): {seed}")
+                            print(f"Определен формат: {file_type}")
+                            print(f"AES Ключ (hex): {key.hex()}")
+                            format_found = True
+                            break
                     
-                    padding_len = decrypted_data[-1]
-                    if 0 < padding_len <= 16 and decrypted_data.endswith(bytes([padding_len]) * padding_len):
-                         decrypted_data = decrypted_data[:-padding_len]
-
-                    output_filename = f"DECRYPTED_{os.path.basename(file_path)}"
-                    with open(output_filename, 'wb') as f_dec:
-                        f_dec.write(decrypted_data)
+                    if format_found:
+                        print("Расшифровываю весь файл...")
+                        if aes_mode == AES.MODE_CBC:
+                            full_cipher = AES.new(key, aes_mode, iv)
+                            decrypted_data = full_cipher.decrypt(file_data[16:])
+                        else:
+                            full_cipher = AES.new(key, aes_mode)
+                            decrypted_data = full_cipher.decrypt(file_data)
                         
-                    print(f"Файл успешно расшифрован и сохранен как: {output_filename}\n")
-                    return decrypted_data
-                    
-            except Exception:
-                continue
+                        decrypted_data = unpad_pkcs7(decrypted_data)
+
+                        output_filename = f"DECRYPTED_{os.path.basename(file_path)}"
+                        with open(output_filename, 'wb') as f_dec:
+                            f_dec.write(decrypted_data)
+                            
+                        print(f"Файл успешно расшифрован и сохранен как: {output_filename}\n")
+                        return decrypted_data
+                        
+                except Exception:
+                    continue
                 
         print("\n\nКлюч не найден в заданном временном диапазоне. Возможно, сигнатуры нет в словаре или файл был изменен сильно позже шифрования.")
         return None
@@ -112,9 +130,10 @@ def brute_force_decrypt(file_path, search_window_seconds=120):
         return None
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Использование: python decryptor.py <путь_к_зашифрованному_файлу>")
-        sys.exit(1)
-        
-    target_file = sys.argv[1]
-    brute_force_decrypt(target_file)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file")
+    parser.add_argument("-t", "--timestamp", type=int)
+    parser.add_argument("-w", "--window", type=int, default=120)
+    args = parser.parse_args()
+    
+    brute_force_decrypt(args.file, search_window_seconds=args.window, custom_timestamp=args.timestamp)
